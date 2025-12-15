@@ -1,402 +1,336 @@
-﻿using System;
+﻿// Form1.cs
+// SG Archive Manager (WinForms .NET 8)
+//
+// Features:
+// - Upload: prep scan (files + bytes) → confirm → upload file-by-file with progress + ETA + cancel + Google Chat notifications
+// - Browse: list archives (top-level prefixes) with size + object count, export CSV
+// - Browse tree: prefix explorer + files grid
+// - Restore: restore selected file or current folder with progress + ETA + cancel + Google Chat notifications
+//   * During large single-file restores, uses Marquee (activity) until each file completes, then updates % between files.
+//
+// Requirements:
+// - AWS CLI in PATH (aws.exe)
+// - AWS credentials configured on machine (profile or env)
+// - appsettings.local.json next to EXE (AppContext.BaseDirectory)
+//   {
+//     "BucketName": "sticksandglassarchive",
+//     "GoogleChatWebhookUrl": "https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=..."
+//   }
+
+using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Net.Http;
-using System.Text.Json;
 
 namespace ArchiveManager
 {
     public partial class Form1 : Form
     {
-        private const string BucketName = "sticksandglassarchive";
+        private readonly HttpClient _http = new HttpClient();
 
-        // NOTE: You should rotate this webhook if it was ever shared outside your org.
-        private const string GoogleChatWebhookUrl =
-            "https://chat.googleapis.com/v1/spaces/AAAAPmYlk7E/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=nF_EfKaa76HFVfaLah_HXr6S4E_cnO-bvjxyITQ88rg";
+        private string _bucketName = "sticksandglassarchive";
+        private string? _googleChatWebhookUrl;
 
-        // Browse: archive table
-        private readonly List<ArchiveInfo> _archiveStats = new();
+        private readonly BindingList<ArchiveInfo> _archiveStats = new BindingList<ArchiveInfo>();
+        private readonly BindingList<S3FileRow> _files = new BindingList<S3FileRow>();
 
-        // Browse: current selection
-        private string? _selectedArchiveName;
-        private string _selectedRelativePrefix = ""; // within archive, e.g. "Media/CamA/"
-        private readonly List<S3ObjectRow> _currentFiles = new();
+        private string? _selectedArchive;
+        private string _currentPrefix = ""; // within archive, e.g. "Assets/001_RUSHES/"
 
-        // Upload tracking
-        private int _uploadTotalFiles;
-        private int _uploadedFiles;
-        private int _lastProgressLoggedAt;
-        private DateTime? _uploadStartTime;
+        private CancellationTokenSource? _uploadCts;
+        private CancellationTokenSource? _restoreCts;
 
         public Form1()
         {
             InitializeComponent();
-            ConfigureArchiveGrid();
-            ConfigureFilesGrid();
-            ResetBrowserUi();
+
+            gridArchives.AutoGenerateColumns = true;
+            gridArchives.DataSource = _archiveStats;
+
+            gridFiles.AutoGenerateColumns = true;
+            gridFiles.DataSource = _files;
+
+            progressArchive.Minimum = 0;
+            progressArchive.Maximum = 100;
+            progressArchive.Value = 0;
+            lblArchiveEta.Text = "";
+
+            progressRestore.Minimum = 0;
+            progressRestore.Maximum = 100;
+            progressRestore.Value = 0;
+            lblRestoreEta.Text = "";
+            txtRestoreLog.Text = "";
+
+            txtArchiveLog.Text = "";
+
+            LoadLocalSettings();
         }
 
-        // -----------------------
-        // Archive tab (upload)
-        // -----------------------
-
-        private void btnBrowseSource_Click(object sender, EventArgs e)
+        // -----------------------------
+        // Settings
+        // -----------------------------
+        private void LoadLocalSettings()
         {
-            using var dialog = new FolderBrowserDialog
+            try
             {
-                Description = "Select the project folder to archive",
-                UseDescriptionForTitle = true
-            };
-
-            if (dialog.ShowDialog(this) == DialogResult.OK)
-            {
-                txtSourcePath.Text = dialog.SelectedPath;
-
-                if (string.IsNullOrWhiteSpace(txtArchiveName.Text))
+                string path = Path.Combine(AppContext.BaseDirectory, "appsettings.local.json");
+                if (!File.Exists(path))
                 {
-                    txtArchiveName.Text = Path.GetFileName(dialog.SelectedPath.TrimEnd(Path.DirectorySeparatorChar));
+                    AppendArchiveLog($"Settings not found: {path} (OK)");
+                    return;
                 }
+
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                using var doc = JsonDocument.Parse(json);
+
+                if (doc.RootElement.TryGetProperty("BucketName", out var bucketProp))
+                {
+                    var b = bucketProp.GetString();
+                    if (!string.IsNullOrWhiteSpace(b))
+                        _bucketName = b.Trim();
+                }
+
+                if (doc.RootElement.TryGetProperty("GoogleChatWebhookUrl", out var hookProp))
+                {
+                    var url = hookProp.GetString();
+                    if (!string.IsNullOrWhiteSpace(url))
+                        _googleChatWebhookUrl = url.Trim();
+                }
+
+                AppendArchiveLog($"Loaded settings. Bucket={_bucketName}");
+            }
+            catch (Exception ex)
+            {
+                AppendArchiveLog($"Failed to load appsettings.local.json: {ex.Message}");
             }
         }
 
+        // -----------------------------
+        // Archive tab: browse source
+        // -----------------------------
+        private void btnBrowseSource_Click(object sender, EventArgs e)
+        {
+            using var dialog = new FolderBrowserDialog();
+            dialog.Description = "Select the source folder to upload";
+            dialog.ShowNewFolderButton = false;
+
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+                txtSourcePath.Text = dialog.SelectedPath;
+        }
+
+        // -----------------------------
+        // Upload (prep, progress, cancel, chat)
+        // -----------------------------
         private async void btnStartUpload_Click(object sender, EventArgs e)
         {
-            txtArchiveLog.Clear();
-            lblArchiveEta.Text = "Preparing upload...";
-
-            var sourcePath = txtSourcePath.Text.Trim();
-            var archiveName = txtArchiveName.Text.Trim();
-
-            if (string.IsNullOrWhiteSpace(sourcePath) || !Directory.Exists(sourcePath))
+            if (_uploadCts != null)
             {
-                AppendLog(txtArchiveLog, "ERROR: Source path does not exist.");
-                lblArchiveEta.Text = "ERROR: Source path does not exist.";
+                _uploadCts.Cancel();
+                return;
+            }
+
+            string source = (txtSourcePath.Text ?? "").Trim();
+            string archiveName = (txtArchiveName.Text ?? "").Trim();
+
+            if (string.IsNullOrWhiteSpace(source) || !Directory.Exists(source))
+            {
+                MessageBox.Show(this, "Pick a valid source folder.", "Upload", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             if (string.IsNullOrWhiteSpace(archiveName))
             {
-                archiveName = Path.GetFileName(sourcePath.TrimEnd(Path.DirectorySeparatorChar));
-                txtArchiveName.Text = archiveName;
+                MessageBox.Show(this, "Enter an archive name (this becomes the folder in S3).", "Upload", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
 
-            var bucketPath = $"s3://{BucketName}/{archiveName}/";
+            var prep = await Task.Run(() => PrepScan(source));
+            string sizeHuman = FormatBytes(prep.TotalBytes);
 
-            AppendLog(txtArchiveLog, $"Source:      {sourcePath}");
-            AppendLog(txtArchiveLog, $"Destination: {bucketPath}");
-            AppendLog(txtArchiveLog, "");
+            var confirm = MessageBox.Show(
+                this,
+                $"You are about to upload:\n\nSource:\n{source}\n\nArchive folder:\n{archiveName}\n\nFiles: {prep.FileCount:n0}\nTotal size: {sizeHuman}\n\nProceed?",
+                "Confirm Upload",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question
+            );
 
-            AppendLog(txtArchiveLog, "Analysing source folder (counting files and total size)...");
-            progressArchive.Style = ProgressBarStyle.Marquee;
-            progressArchive.MarqueeAnimationSpeed = 30;
+            if (confirm != DialogResult.Yes)
+                return;
 
-            (int fileCount, long totalBytes) analysis;
+            _uploadCts = new CancellationTokenSource();
+            btnStartUpload.Text = "Cancel Upload";
+            btnStartUpload.Enabled = true;
+
+            progressArchive.Style = ProgressBarStyle.Blocks;
+            progressArchive.Value = 0;
+            lblArchiveEta.Text = "";
+
+            AppendArchiveLog($"Starting upload to s3://{_bucketName}/{archiveName}/");
+            await SendChatSafeAsync($"📦 Upload started: `{archiveName}`\nFiles: {prep.FileCount:n0}\nSize: {sizeHuman}");
+
+            var sw = Stopwatch.StartNew();
+            long bytesDone = 0;
+            int filesDone = 0;
+
             try
             {
-                analysis = await Task.Run(() => AnalyzeSourceFolder(sourcePath));
+                var files = prep.Files;
+
+                foreach (var file in files)
+                {
+                    _uploadCts.Token.ThrowIfCancellationRequested();
+
+                    string rel = Path.GetRelativePath(source, file).Replace('\\', '/');
+                    string key = $"{archiveName}/{rel}";
+                    long len = new FileInfo(file).Length;
+
+                    AppendArchiveLog($"UPLOAD: {rel}");
+
+                    await RunAwsAsync(
+                        $"s3 cp \"{file}\" \"s3://{_bucketName}/{key}\" --only-show-errors",
+                        _uploadCts.Token,
+                        onStdErrLine: (line) =>
+                        {
+                            if (!string.IsNullOrWhiteSpace(line))
+                                AppendArchiveLog(line);
+                        }
+                    );
+
+                    filesDone++;
+                    bytesDone += len;
+
+                    UpdateProgressWithEta(
+                        progressArchive,
+                        lblArchiveEta,
+                        bytesDone,
+                        prep.TotalBytes,
+                        sw.Elapsed,
+                        filesDone,
+                        prep.FileCount
+                    );
+                }
+
+                sw.Stop();
+                progressArchive.Value = 100;
+                lblArchiveEta.Text = $"Complete. {prep.FileCount:n0} files, {FormatBytes(prep.TotalBytes)} in {FormatDuration(sw.Elapsed)}.";
+
+                AppendArchiveLog("Upload finished.");
+                await SendChatSafeAsync($"✅ Upload finished: `{archiveName}`\nSize: {sizeHuman}\nDuration: {FormatDuration(sw.Elapsed)}");
+            }
+            catch (OperationCanceledException)
+            {
+                AppendArchiveLog("Upload cancelled.");
+                await SendChatSafeAsync($"🛑 Upload cancelled: `{archiveName}`");
             }
             catch (Exception ex)
             {
-                progressArchive.Style = ProgressBarStyle.Blocks;
-                progressArchive.MarqueeAnimationSpeed = 0;
-                AppendLog(txtArchiveLog, $"ERROR during analysis: {ex.Message}");
-                lblArchiveEta.Text = $"ERROR during analysis: {ex.Message}";
-                return;
-            }
-
-            _uploadTotalFiles = analysis.fileCount;
-            _uploadedFiles = 0;
-            _lastProgressLoggedAt = 0;
-            _uploadStartTime = DateTime.UtcNow;
-
-            progressArchive.Style = ProgressBarStyle.Blocks;
-            progressArchive.MarqueeAnimationSpeed = 0;
-            progressArchive.Minimum = 0;
-            progressArchive.Maximum = _uploadTotalFiles == 0 ? 1 : _uploadTotalFiles;
-            progressArchive.Value = 0;
-
-            AppendLog(txtArchiveLog, $"Found {_uploadTotalFiles} files, total size {FormatBytes(analysis.totalBytes)}");
-            AppendLog(txtArchiveLog, "");
-            AppendLog(txtArchiveLog, "Starting upload...");
-            AppendLog(txtArchiveLog, "");
-
-            lblArchiveEta.Text = _uploadTotalFiles > 0
-                ? $"Progress: 0/{_uploadTotalFiles} files (0.0%), ETA: calculating..."
-                : "No files found to upload.";
-
-            btnStartUpload.Enabled = false;
-
-            try
-            {
-                var args = $"s3 sync \"{sourcePath}\" \"{bucketPath}\"";
-
-                var exitCode = await RunAwsCommandAsync(args, line =>
-                {
-                    if (line != null)
-                    {
-                        AppendLog(txtArchiveLog, line);
-
-                        var trimmed = line.TrimStart();
-                        if (trimmed.StartsWith("upload:", StringComparison.OrdinalIgnoreCase))
-                        {
-                            NotifyFileUploaded();
-                        }
-                    }
-                });
-
-                AppendLog(txtArchiveLog, "");
-                AppendLog(txtArchiveLog, $"aws s3 sync exit code: {exitCode}");
-
-                if (_uploadTotalFiles > 0)
-                {
-                    progressArchive.Value = progressArchive.Maximum;
-                    _uploadedFiles = _uploadTotalFiles;
-                    NotifyFileUploaded(forceLog: true);
-                }
-
-                if (_uploadTotalFiles > 0 && _uploadStartTime.HasValue)
-                {
-                    var elapsed = DateTime.UtcNow - _uploadStartTime.Value;
-                    lblArchiveEta.Text = exitCode == 0
-                        ? $"Upload complete: {_uploadTotalFiles}/{_uploadTotalFiles} files (100%), elapsed {elapsed:hh\\:mm\\:ss}"
-                        : $"Upload finished with errors (exit code {exitCode}). See log for details.";
-                }
-
-                // Google Chat notification
-                if (exitCode == 0)
-                {
-                    var elapsed = _uploadStartTime.HasValue ? (DateTime.UtcNow - _uploadStartTime.Value) : (TimeSpan?)null;
-                    var msg = $"✅ Archive '{archiveName}' is now complete in bucket '{BucketName}'.";
-                    if (elapsed.HasValue) msg += $" Elapsed time: {elapsed.Value:hh\\:mm\\:ss}.";
-                    _ = NotifyGoogleChatAsync(msg);
-                }
-                else
-                {
-                    _ = NotifyGoogleChatAsync($"⚠️ Archive '{archiveName}' upload finished with errors (exit code {exitCode}).");
-                }
+                AppendArchiveLog($"Upload failed: {ex.Message}");
+                await SendChatSafeAsync($"❌ Upload failed: `{archiveName}`\nError: {ex.Message}");
+                MessageBox.Show(this, $"Upload failed:\n{ex.Message}", "Upload", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
-                btnStartUpload.Enabled = true;
-                _uploadStartTime = null;
+                _uploadCts?.Dispose();
+                _uploadCts = null;
+                btnStartUpload.Text = "Start Upload";
             }
         }
 
-        private (int fileCount, long totalBytes) AnalyzeSourceFolder(string sourcePath)
+        private PrepResult PrepScan(string root)
         {
-            int count = 0;
-            long totalBytes = 0;
+            var list = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).ToList();
+            long total = 0;
 
-            foreach (var file in Directory.EnumerateFiles(sourcePath, "*", SearchOption.AllDirectories))
+            foreach (var f in list)
             {
-                count++;
-                try
-                {
-                    totalBytes += new FileInfo(file).Length;
-                }
-                catch { /* ignore */ }
+                try { total += new FileInfo(f).Length; }
+                catch { }
             }
 
-            return (count, totalBytes);
+            return new PrepResult
+            {
+                FileCount = list.Count,
+                TotalBytes = total,
+                Files = list
+            };
         }
 
-        private void NotifyFileUploaded(bool forceLog = false)
-        {
-            if (InvokeRequired)
-            {
-                BeginInvoke(new Action<bool>(NotifyFileUploaded), forceLog);
-                return;
-            }
-
-            if (_uploadTotalFiles <= 0) return;
-
-            _uploadedFiles++;
-            if (_uploadedFiles > progressArchive.Maximum) _uploadedFiles = progressArchive.Maximum;
-            if (_uploadedFiles < 0) _uploadedFiles = 0;
-
-            progressArchive.Value = _uploadedFiles;
-
-            if (!_uploadStartTime.HasValue) return;
-
-            double fraction = _uploadTotalFiles > 0 ? _uploadedFiles / (double)_uploadTotalFiles : 0d;
-            if (fraction <= 0) return;
-
-            var elapsed = DateTime.UtcNow - _uploadStartTime.Value;
-            double totalSeconds = elapsed.TotalSeconds / fraction;
-            var remaining = TimeSpan.FromSeconds(Math.Max(0, totalSeconds - elapsed.TotalSeconds));
-            double percent = fraction * 100.0;
-
-            lblArchiveEta.Text =
-                $"Progress: {_uploadedFiles}/{_uploadTotalFiles} files ({percent:0.0}%), ETA {remaining:hh\\:mm\\:ss}";
-
-            if (!forceLog && _uploadedFiles < _uploadTotalFiles && _uploadedFiles < _lastProgressLoggedAt + 10)
-                return;
-
-            _lastProgressLoggedAt = _uploadedFiles;
-
-            AppendLog(txtArchiveLog,
-                $"Progress: {_uploadedFiles}/{_uploadTotalFiles} files ({percent:0.0}%), ETA {remaining:hh\\:mm\\:ss}");
-        }
-
-        // -----------------------
-        // Browse tab (Explorer)
-        // -----------------------
-
-        private void ConfigureArchiveGrid()
-        {
-            gridArchives.AllowUserToAddRows = false;
-            gridArchives.AllowUserToDeleteRows = false;
-            gridArchives.ReadOnly = true;
-            gridArchives.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-            gridArchives.MultiSelect = false;
-            gridArchives.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
-
-            gridArchives.Columns.Clear();
-
-            gridArchives.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "ArchiveName",
-                HeaderText = "Archive Name",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
-            });
-
-            gridArchives.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "SizeHuman",
-                HeaderText = "Size",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
-            });
-
-            gridArchives.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "SizeBytes",
-                HeaderText = "Size (bytes)",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
-            });
-
-            gridArchives.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "ObjectCount",
-                HeaderText = "Objects",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
-            });
-        }
-
-        private void ConfigureFilesGrid()
-        {
-            gridFiles.AllowUserToAddRows = false;
-            gridFiles.AllowUserToDeleteRows = false;
-            gridFiles.ReadOnly = true;
-            gridFiles.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-            gridFiles.MultiSelect = false;
-            gridFiles.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
-
-            gridFiles.Columns.Clear();
-
-            gridFiles.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "FileName",
-                HeaderText = "Name",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
-            });
-
-            gridFiles.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "SizeHuman",
-                HeaderText = "Size",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
-            });
-
-            gridFiles.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "LastModified",
-                HeaderText = "Last Modified",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
-            });
-
-            gridFiles.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "S3Key",
-                HeaderText = "S3 Key",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
-            });
-        }
-
-        private void ResetBrowserUi()
-        {
-            lblBrowsePath.Text = "Select an archive to browse...";
-            treeS3.Nodes.Clear();
-            gridFiles.Rows.Clear();
-            _currentFiles.Clear();
-            _selectedArchiveName = null;
-            _selectedRelativePrefix = "";
-        }
-
+        // -----------------------------
+        // Browse tab: List Archives + Export CSV
+        // -----------------------------
         private async void btnBrowseRefresh_Click(object sender, EventArgs e)
         {
-            _archiveStats.Clear();
-            gridArchives.Rows.Clear();
-            ResetBrowserUi();
+            btnBrowseRefresh.Enabled = false;
+            btnExportCsv.Enabled = false;
 
-            var listText = new StringBuilder();
-
-            int exitCode = await RunAwsCommandAsync(
-                $"s3 ls s3://{BucketName}/",
-                line => { if (line != null) listText.AppendLine(line); });
-
-            if (exitCode != 0)
+            try
             {
-                MessageBox.Show(this, $"aws s3 ls exited with code {exitCode}", "Error",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
+                _archiveStats.Clear();
+                _selectedArchive = null;
+                _currentPrefix = "";
+                treeS3.Nodes.Clear();
+                _files.Clear();
+                lblBrowsePath.Text = "Loading archives...";
 
-            var lines = listText.ToString().Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            var archives = new List<string>();
+                var archives = await ListTopLevelPrefixesAsync(CancellationToken.None);
 
-            foreach (var line in lines)
-            {
-                var trimmed = line.Trim();
-                if (trimmed.StartsWith("PRE "))
+                foreach (var a in archives)
                 {
-                    archives.Add(trimmed.Substring(4).TrimEnd('/'));
-                }
-                else
-                {
-                    var parts = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length > 0)
+                    lblBrowsePath.Text = $"Calculating stats: {a} ...";
+                    var stats = await GetPrefixStatsAsync(a + "/", CancellationToken.None);
+                    _archiveStats.Add(new ArchiveInfo
                     {
-                        var last = parts[^1];
-                        if (last.EndsWith("/"))
-                            archives.Add(last.TrimEnd('/'));
-                    }
+                        Name = a,
+                        SizeBytes = stats.TotalBytes,
+                        ObjectCount = stats.ObjectCount
+                    });
                 }
-            }
 
-            foreach (var archive in archives)
+                lblBrowsePath.Text = "Select an archive to browse...";
+                btnExportCsv.Enabled = _archiveStats.Count > 0;
+            }
+            catch (Exception ex)
             {
-                var (totalBytes, totalObjects) = await GetArchiveStatsAsync(archive);
-
-                var info = new ArchiveInfo
-                {
-                    Name = archive,
-                    SizeBytes = totalBytes,
-                    ObjectCount = totalObjects
-                };
-                _archiveStats.Add(info);
-
-                gridArchives.Rows.Add(info.Name, FormatBytes(info.SizeBytes), info.SizeBytes, info.ObjectCount >= 0 ? info.ObjectCount : 0);
+                lblBrowsePath.Text = "Failed to list archives.";
+                MessageBox.Show(this, $"List Archives failed:\n{ex.Message}", "Browse", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-
-            if (archives.Count == 0)
+            finally
             {
-                MessageBox.Show(this, "No archives found at top level of bucket.", "Browse",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                btnBrowseRefresh.Enabled = true;
             }
+        }
+
+        private void gridArchives_SelectionChanged(object sender, EventArgs e)
+        {
+            if (gridArchives.CurrentRow == null)
+                return;
+
+            if (gridArchives.CurrentRow.DataBoundItem is not ArchiveInfo ai)
+                return;
+
+            if (string.IsNullOrWhiteSpace(ai.Name))
+                return;
+
+            _selectedArchive = ai.Name;
+            _currentPrefix = "";
+            lblBrowsePath.Text = $"s3://{_bucketName}/{_selectedArchive}/";
+
+            treeS3.Nodes.Clear();
+            var root = new TreeNode(_selectedArchive) { Tag = "" };
+            root.Nodes.Add(new TreeNode("loading...") { Tag = "__DUMMY__" });
+            treeS3.Nodes.Add(root);
+            root.Expand();
+
+            _ = LoadPrefixIntoFilesGridAsync(_selectedArchive, "");
         }
 
         private void btnExportCsv_Click(object sender, EventArgs e)
@@ -408,12 +342,10 @@ namespace ArchiveManager
                 return;
             }
 
-            using var dialog = new SaveFileDialog
-            {
-                Title = "Export archive list to CSV",
-                Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*",
-                FileName = $"archive-list-{DateTime.Now:yyyy-MM-dd_HHmmss}.csv"
-            };
+            using var dialog = new SaveFileDialog();
+            dialog.Title = "Export archive list to CSV";
+            dialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*";
+            dialog.FileName = $"archive-list-{DateTime.Now:yyyy-MM-dd_HHmmss}.csv";
 
             if (dialog.ShowDialog(this) != DialogResult.OK)
                 return;
@@ -426,8 +358,8 @@ namespace ArchiveManager
                 foreach (var info in _archiveStats)
                 {
                     string sizeHuman = FormatBytes(info.SizeBytes);
-                    string nameEscaped = info.Name.Replace("\"", "\"\"");
-                    writer.WriteLine($"\"{nameEscaped}\",{info.SizeBytes},{info.ObjectCount},{sizeHuman}");
+                    string safeName = info.Name.Replace("\"", "\"\"");
+                    writer.WriteLine($"\"{safeName}\",{info.SizeBytes},{info.ObjectCount},{sizeHuman}");
                 }
 
                 MessageBox.Show(this, "CSV export complete.", "Export CSV",
@@ -435,574 +367,750 @@ namespace ArchiveManager
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, $"Failed to export CSV: {ex.Message}", "Export CSV",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, $"Failed to export CSV: {ex.Message}",
+                    "Export CSV", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
-        private async void gridArchives_SelectionChanged(object sender, EventArgs e)
-        {
-            if (gridArchives.SelectedRows.Count == 0)
-                return;
-
-            var row = gridArchives.SelectedRows[0];
-            var archiveObj = row.Cells["ArchiveName"].Value;
-            var archiveName = archiveObj as string ?? archiveObj?.ToString();
-
-            if (string.IsNullOrWhiteSpace(archiveName))
-                return;
-
-            _selectedArchiveName = archiveName;
-            _selectedRelativePrefix = "";
-
-            treeS3.Nodes.Clear();
-            gridFiles.Rows.Clear();
-            _currentFiles.Clear();
-
-            // Root node = archive
-            var root = new TreeNode(archiveName)
-            {
-                Tag = "" // relative prefix
-            };
-            root.Nodes.Add(new TreeNode("Loading...") { Tag = "__placeholder__" }); // lazy
-            treeS3.Nodes.Add(root);
-            root.Expand();
-
-            lblBrowsePath.Text = $"s3://{BucketName}/{archiveName}/";
-
-            // Also load root listing into files grid
-            await LoadPrefixIntoFilesGridAsync(archiveName, "");
-        }
-
+        // -----------------------------
+        // Tree explorer (prefix browsing)
+        // -----------------------------
         private async void treeS3_BeforeExpand(object sender, TreeViewCancelEventArgs e)
         {
-            if (_selectedArchiveName == null)
-                return;
+            if (_selectedArchive == null) return;
 
-            // If node has placeholder child, load actual children
-            if (e.Node.Nodes.Count == 1 && (e.Node.Nodes[0].Tag as string) == "__placeholder__")
-            {
+            if (e.Node.Nodes.Count == 1 && (string?)e.Node.Nodes[0].Tag == "__DUMMY__")
                 e.Node.Nodes.Clear();
 
-                string relPrefix = e.Node.Tag as string ?? "";
-                var folders = await ListFoldersAsync(_selectedArchiveName, relPrefix);
+            string prefixWithinArchive = (string?)e.Node.Tag ?? "";
 
-                foreach (var f in folders)
+            try
+            {
+                var childPrefixes = await ListChildPrefixesAsync(_selectedArchive, prefixWithinArchive, CancellationToken.None);
+                foreach (var cp in childPrefixes)
                 {
-                    var child = new TreeNode(f.DisplayName)
-                    {
-                        Tag = f.RelativePrefix
-                    };
-
-                    // Add placeholder to enable lazy expand
-                    child.Nodes.Add(new TreeNode("Loading...") { Tag = "__placeholder__" });
-                    e.Node.Nodes.Add(child);
+                    var node = new TreeNode(cp) { Tag = JoinPrefix(prefixWithinArchive, cp) };
+                    node.Nodes.Add(new TreeNode("loading...") { Tag = "__DUMMY__" });
+                    e.Node.Nodes.Add(node);
                 }
+            }
+            catch
+            {
             }
         }
 
         private async void treeS3_AfterSelect(object sender, TreeViewEventArgs e)
         {
-            if (_selectedArchiveName == null)
-                return;
+            if (_selectedArchive == null) return;
 
-            string relPrefix = e.Node.Tag as string ?? "";
-            _selectedRelativePrefix = relPrefix;
+            string prefixWithinArchive = (string?)e.Node.Tag ?? "";
+            _currentPrefix = prefixWithinArchive;
 
-            lblBrowsePath.Text = $"s3://{BucketName}/{_selectedArchiveName}/{relPrefix}";
-            await LoadPrefixIntoFilesGridAsync(_selectedArchiveName, relPrefix);
-        }
-
-        private void btnBrowseUp_Click(object sender, EventArgs e)
-        {
-            if (treeS3.SelectedNode == null) return;
-            var node = treeS3.SelectedNode;
-            if (node.Parent != null)
-            {
-                treeS3.SelectedNode = node.Parent;
-            }
+            lblBrowsePath.Text = $"s3://{_bucketName}/{_selectedArchive}/{prefixWithinArchive}";
+            await LoadPrefixIntoFilesGridAsync(_selectedArchive, prefixWithinArchive);
         }
 
         private async Task LoadPrefixIntoFilesGridAsync(string archiveName, string relativePrefix)
         {
-            gridFiles.Rows.Clear();
-            _currentFiles.Clear();
-
-            var objects = await ListFilesAsync(archiveName, relativePrefix);
-
-            foreach (var o in objects)
+            try
             {
-                _currentFiles.Add(o);
-
-                gridFiles.Rows.Add(
-                    o.FileName,
-                    FormatBytes(o.SizeBytes),
-                    o.LastModifiedText,
-                    o.Key
-                );
+                _files.Clear();
+                var rows = await ListFilesAsync(archiveName, relativePrefix);
+                foreach (var r in rows)
+                    _files.Add(r);
+            }
+            catch (Exception ex)
+            {
+                _files.Clear();
+                _files.Add(new S3FileRow { Key = $"(error) {ex.Message}", SizeBytes = 0, LastModified = "" });
             }
         }
 
-        private async Task<List<S3FolderRow>> ListFoldersAsync(string archiveName, string relativePrefix)
+        private void btnBrowseUp_Click(object sender, EventArgs e)
         {
-            // We list one level deep under: prefix = $"{archiveName}/{relativePrefix}"
-            string fullPrefix = CombineS3Prefix(archiveName, relativePrefix);
+            if (_selectedArchive == null) return;
+            if (string.IsNullOrEmpty(_currentPrefix)) return;
 
-            JsonDocument doc = await S3ApiListObjectsV2Async(fullPrefix, delimiter: "/");
+            var parts = _currentPrefix.TrimEnd('/').Split('/');
+            if (parts.Length <= 1)
+                _currentPrefix = "";
+            else
+                _currentPrefix = string.Join("/", parts.Take(parts.Length - 1)) + "/";
 
-            var result = new List<S3FolderRow>();
+            lblBrowsePath.Text = $"s3://{_bucketName}/{_selectedArchive}/{_currentPrefix}";
+            _ = LoadPrefixIntoFilesGridAsync(_selectedArchive, _currentPrefix);
+        }
+
+        private static string JoinPrefix(string parentWithinArchive, string childName)
+        {
+            var p = parentWithinArchive ?? "";
+            if (!string.IsNullOrEmpty(p) && !p.EndsWith("/")) p += "/";
+            return p + childName + "/";
+        }
+
+        // -----------------------------
+        // Restore with progress + chat confirmations
+        // -----------------------------
+        private async void btnRestoreSelectedFile_Click(object sender, EventArgs e)
+        {
+            if (_selectedArchive == null)
+            {
+                MessageBox.Show(this, "Select an archive first.", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (_restoreCts != null)
+            {
+                _restoreCts.Cancel();
+                return;
+            }
+
+            if (gridFiles.CurrentRow == null || gridFiles.CurrentRow.DataBoundItem is not S3FileRow selected)
+            {
+                MessageBox.Show(this, "Select a file row first.", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(selected.Key) || selected.Key.EndsWith("/"))
+            {
+                MessageBox.Show(this, "Select a file (not a folder marker).", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using var dialog = new FolderBrowserDialog();
+            dialog.Description = "Select local folder to restore into";
+            dialog.ShowNewFolderButton = true;
+
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            string destRoot = dialog.SelectedPath;
+
+            await RestoreObjectsWithUiAsync(
+                archiveName: _selectedArchive,
+                objects: new List<S3ObjectRef> {
+                    new S3ObjectRef {
+                        Key = selected.Key,
+                        SizeBytes = selected.SizeBytes
+                    }
+                },
+                destRoot: destRoot,
+                displayName: $"file {Path.GetFileName(selected.Key)}"
+            );
+        }
+
+        private async void btnRestoreFolder_Click(object sender, EventArgs e)
+        {
+            if (_selectedArchive == null)
+            {
+                MessageBox.Show(this, "Select an archive first.", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (_restoreCts != null)
+            {
+                _restoreCts.Cancel();
+                return;
+            }
+
+            string fullPrefix = $"{_selectedArchive}/{_currentPrefix}".TrimEnd('/') + "/";
+
+            using var dialog = new FolderBrowserDialog();
+            dialog.Description = "Select local folder to restore into";
+            dialog.ShowNewFolderButton = true;
+
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            string destRoot = dialog.SelectedPath;
+
+            txtRestoreLog.Text = "";
+            AppendRestoreLog($"Preparing restore listing for: s3://{_bucketName}/{fullPrefix}");
+
+            List<S3ObjectRef> objects;
+            try
+            {
+                objects = await ListAllObjectsUnderPrefixAsync(fullPrefix, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to enumerate folder:\n{ex.Message}", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (objects.Count == 0)
+            {
+                MessageBox.Show(this, "No files found under this folder.", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            long totalBytes = objects.Sum(o => o.SizeBytes);
+            var confirm = MessageBox.Show(
+                this,
+                $"Restore folder:\n\ns3://{_bucketName}/{fullPrefix}\n\nFiles: {objects.Count:n0}\nSize: {FormatBytes(totalBytes)}\n\nProceed?",
+                "Confirm Restore",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question
+            );
+
+            if (confirm != DialogResult.Yes)
+                return;
+
+            await RestoreObjectsWithUiAsync(
+                archiveName: _selectedArchive,
+                objects: objects,
+                destRoot: destRoot,
+                displayName: $"folder {_currentPrefix}"
+            );
+        }
+
+        private async Task RestoreObjectsWithUiAsync(string archiveName, List<S3ObjectRef> objects, string destRoot, string displayName)
+        {
+            _restoreCts = new CancellationTokenSource();
+
+            btnRestoreSelectedFile.Text = "Cancel Restore";
+            btnRestoreFolder.Text = "Cancel Restore";
+            btnRestoreSelectedFile.Enabled = true;
+            btnRestoreFolder.Enabled = true;
+
+            progressRestore.Value = 0;
+            progressRestore.Style = ProgressBarStyle.Marquee;
+            progressRestore.MarqueeAnimationSpeed = 25;
+
+            lblRestoreEta.Text = "Starting restore...";
+            txtRestoreLog.Text = "";
+
+            long totalBytes = objects.Sum(o => o.SizeBytes);
+            string totalHuman = FormatBytes(totalBytes);
+
+            AppendRestoreLog($"Starting restore ({displayName})");
+            AppendRestoreLog($"Files: {objects.Count:n0}  Size: {totalHuman}");
+            await SendChatSafeAsync($"⬇️ Restore started: `{archiveName}`\nTarget: {displayName}\nFiles: {objects.Count:n0}\nSize: {totalHuman}");
+
+            var sw = Stopwatch.StartNew();
+            long bytesDone = 0;
+            int filesDone = 0;
+
+            try
+            {
+                foreach (var obj in objects)
+                {
+                    _restoreCts.Token.ThrowIfCancellationRequested();
+
+                    string relative = obj.Key.Replace('\\', '/');
+                    if (relative.StartsWith(archiveName + "/", StringComparison.OrdinalIgnoreCase))
+                        relative = relative.Substring(archiveName.Length + 1);
+
+                    string localPath = Path.Combine(destRoot, archiveName, relative.Replace('/', Path.DirectorySeparatorChar));
+                    string localDir = Path.GetDirectoryName(localPath) ?? Path.Combine(destRoot, archiveName);
+                    Directory.CreateDirectory(localDir);
+
+                    AppendRestoreLog($"RESTORE: {relative}");
+
+                    SafeUi(() =>
+                    {
+                        // activity indicator during single large file downloads
+                        progressRestore.Style = ProgressBarStyle.Marquee;
+                        progressRestore.MarqueeAnimationSpeed = 25;
+                        lblRestoreEta.Text = $"Downloading: {Path.GetFileName(obj.Key)} ...";
+                    });
+
+                    await RunAwsAsync(
+                        $"s3 cp \"s3://{_bucketName}/{obj.Key}\" \"{localPath}\" --only-show-errors",
+                        _restoreCts.Token,
+                        onStdErrLine: (line) =>
+                        {
+                            if (!string.IsNullOrWhiteSpace(line))
+                                AppendRestoreLog(line);
+                        }
+                    );
+
+                    filesDone++;
+                    bytesDone += obj.SizeBytes;
+
+                    // switch to blocks to show percentage between files
+                    SafeUi(() =>
+                    {
+                        progressRestore.Style = ProgressBarStyle.Blocks;
+                        progressRestore.MarqueeAnimationSpeed = 0;
+                    });
+
+                    UpdateProgressWithEta(
+                        progressRestore,
+                        lblRestoreEta,
+                        bytesDone,
+                        totalBytes,
+                        sw.Elapsed,
+                        filesDone,
+                        objects.Count
+                    );
+                }
+
+                sw.Stop();
+                SafeUi(() =>
+                {
+                    progressRestore.Style = ProgressBarStyle.Blocks;
+                    progressRestore.MarqueeAnimationSpeed = 0;
+                    progressRestore.Value = 100;
+                    lblRestoreEta.Text = $"Complete. {objects.Count:n0} files, {totalHuman} in {FormatDuration(sw.Elapsed)}.";
+                });
+
+                AppendRestoreLog("Restore finished.");
+                await SendChatSafeAsync($"✅ Restore finished: `{archiveName}`\nTarget: {displayName}\nSize: {totalHuman}\nDuration: {FormatDuration(sw.Elapsed)}");
+            }
+            catch (OperationCanceledException)
+            {
+                AppendRestoreLog("Restore cancelled.");
+                await SendChatSafeAsync($"🛑 Restore cancelled: `{archiveName}`\nTarget: {displayName}");
+            }
+            catch (Exception ex)
+            {
+                AppendRestoreLog($"Restore failed: {ex.Message}");
+                await SendChatSafeAsync($"❌ Restore failed: `{archiveName}`\nTarget: {displayName}\nError: {ex.Message}");
+                MessageBox.Show(this, $"Restore failed:\n{ex.Message}", "Restore", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                sw.Stop();
+
+                _restoreCts?.Dispose();
+                _restoreCts = null;
+
+                SafeUi(() =>
+                {
+                    progressRestore.Style = ProgressBarStyle.Blocks;
+                    progressRestore.MarqueeAnimationSpeed = 0;
+                });
+
+                btnRestoreSelectedFile.Text = "Restore Selected File...";
+                btnRestoreFolder.Text = "Restore Folder...";
+            }
+        }
+
+        // -----------------------------
+        // S3 Listing helpers (AWS CLI + JSON)
+        // -----------------------------
+        private async Task<List<string>> ListTopLevelPrefixesAsync(CancellationToken ct)
+        {
+            string args = $"s3api list-objects-v2 --bucket \"{_bucketName}\" --delimiter \"/\" --output json";
+            string json = await RunAwsCaptureStdOutAsync(args, ct);
+
+            using var doc = JsonDocument.Parse(json);
+            var list = new List<string>();
 
             if (doc.RootElement.TryGetProperty("CommonPrefixes", out var cps) && cps.ValueKind == JsonValueKind.Array)
             {
                 foreach (var cp in cps.EnumerateArray())
                 {
-                    if (!cp.TryGetProperty("Prefix", out var pEl)) continue;
-                    var prefix = pEl.GetString() ?? "";
-                    // prefix is full, like "ArchiveName/Media/CamA/"
-                    var rel = StripArchivePrefix(archiveName, prefix);
-                    var display = GetLastFolderName(rel);
-
-                    if (!string.IsNullOrWhiteSpace(rel))
+                    if (cp.TryGetProperty("Prefix", out var p))
                     {
-                        result.Add(new S3FolderRow
+                        var prefix = p.GetString() ?? "";
+                        prefix = prefix.TrimEnd('/');
+                        if (!string.IsNullOrWhiteSpace(prefix))
+                            list.Add(prefix);
+                    }
+                }
+            }
+
+            return list.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private async Task<(long TotalBytes, long ObjectCount)> GetPrefixStatsAsync(string prefix, CancellationToken ct)
+        {
+            long totalBytes = 0;
+            long totalCount = 0;
+            string? token = null;
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                string args = $"s3api list-objects-v2 --bucket \"{_bucketName}\" --prefix \"{prefix}\" --max-items 1000 --output json";
+                if (!string.IsNullOrWhiteSpace(token))
+                    args += $" --starting-token \"{token}\"";
+
+                string json = await RunAwsCaptureStdOutAsync(args, ct);
+                using var doc = JsonDocument.Parse(json);
+
+                if (doc.RootElement.TryGetProperty("Contents", out var contents) && contents.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in contents.EnumerateArray())
+                    {
+                        if (item.TryGetProperty("Size", out var sizeProp))
+                            totalBytes += sizeProp.GetInt64();
+                        totalCount++;
+                    }
+                }
+
+                if (doc.RootElement.TryGetProperty("NextToken", out var nt) && nt.ValueKind == JsonValueKind.String)
+                {
+                    token = nt.GetString();
+                    if (!string.IsNullOrWhiteSpace(token))
+                        continue;
+                }
+
+                break;
+            }
+
+            return (totalBytes, totalCount);
+        }
+
+        private async Task<List<string>> ListChildPrefixesAsync(string archiveName, string relativePrefixWithinArchive, CancellationToken ct)
+        {
+            string prefix = $"{archiveName}/{relativePrefixWithinArchive}".TrimEnd('/');
+            if (!prefix.EndsWith("/")) prefix += "/";
+
+            string args = $"s3api list-objects-v2 --bucket \"{_bucketName}\" --prefix \"{prefix}\" --delimiter \"/\" --output json";
+            string json = await RunAwsCaptureStdOutAsync(args, ct);
+
+            using var doc = JsonDocument.Parse(json);
+            var list = new List<string>();
+
+            if (doc.RootElement.TryGetProperty("CommonPrefixes", out var cps) && cps.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var cp in cps.EnumerateArray())
+                {
+                    if (cp.TryGetProperty("Prefix", out var p))
+                    {
+                        var full = p.GetString() ?? "";
+                        full = full.TrimEnd('/');
+                        var name = full.Split('/').LastOrDefault() ?? "";
+                        if (!string.IsNullOrWhiteSpace(name))
+                            list.Add(name);
+                    }
+                }
+            }
+
+            return list.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private async Task<List<S3FileRow>> ListFilesAsync(string archiveName, string relativePrefixWithinArchive)
+        {
+            string prefix = $"{archiveName}/{relativePrefixWithinArchive}".TrimEnd('/');
+            if (!string.IsNullOrEmpty(prefix) && !prefix.EndsWith("/")) prefix += "/";
+
+            string args = $"s3api list-objects-v2 --bucket \"{_bucketName}\" --prefix \"{prefix}\" --delimiter \"/\" --output json";
+            string json = await RunAwsCaptureStdOutAsync(args, CancellationToken.None);
+
+            using var doc = JsonDocument.Parse(json);
+            var rows = new List<S3FileRow>();
+
+            if (doc.RootElement.TryGetProperty("CommonPrefixes", out var cps) && cps.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var cp in cps.EnumerateArray())
+                {
+                    if (cp.TryGetProperty("Prefix", out var p))
+                    {
+                        var full = p.GetString() ?? "";
+                        rows.Add(new S3FileRow
                         {
-                            RelativePrefix = rel,
-                            DisplayName = display
+                            Key = full,
+                            SizeBytes = 0,
+                            LastModified = "(folder)"
                         });
                     }
                 }
             }
 
-            return result;
+            if (doc.RootElement.TryGetProperty("Contents", out var contents) && contents.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in contents.EnumerateArray())
+                {
+                    string key = item.GetProperty("Key").GetString() ?? "";
+                    long size = item.TryGetProperty("Size", out var sz) ? sz.GetInt64() : 0;
+                    string lm = item.TryGetProperty("LastModified", out var lmProp) ? (lmProp.GetString() ?? "") : "";
+
+                    if (key.EndsWith("/") && size <= 1) continue;
+
+                    rows.Add(new S3FileRow
+                    {
+                        Key = key,
+                        SizeBytes = size,
+                        LastModified = lm
+                    });
+                }
+            }
+
+            return rows
+                .OrderByDescending(r => r.LastModified == "(folder)")
+                .ThenBy(r => r.Key, StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
-        private async Task<List<S3ObjectRow>> ListFilesAsync(string archiveName, string relativePrefix)
+        private async Task<List<S3ObjectRef>> ListAllObjectsUnderPrefixAsync(string fullPrefix, CancellationToken ct)
         {
-            string fullPrefix = CombineS3Prefix(archiveName, relativePrefix);
-
-            // paginate to collect all files under this prefix (non-recursive, with delimiter)
-            var allContents = new List<JsonElement>();
+            var results = new List<S3ObjectRef>();
             string? token = null;
 
             while (true)
             {
-                JsonDocument doc = await S3ApiListObjectsV2Async(fullPrefix, delimiter: "/", continuationToken: token);
+                ct.ThrowIfCancellationRequested();
+
+                string args = $"s3api list-objects-v2 --bucket \"{_bucketName}\" --prefix \"{fullPrefix}\" --max-items 1000 --output json";
+                if (!string.IsNullOrWhiteSpace(token))
+                    args += $" --starting-token \"{token}\"";
+
+                string json = await RunAwsCaptureStdOutAsync(args, ct);
+                using var doc = JsonDocument.Parse(json);
 
                 if (doc.RootElement.TryGetProperty("Contents", out var contents) && contents.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var item in contents.EnumerateArray())
-                        allContents.Add(item);
+                    {
+                        string key = item.GetProperty("Key").GetString() ?? "";
+                        long size = item.TryGetProperty("Size", out var sz) ? sz.GetInt64() : 0;
+
+                        if (key.EndsWith("/") && size <= 1) continue;
+
+                        results.Add(new S3ObjectRef { Key = key, SizeBytes = size });
+                    }
                 }
 
-                if (doc.RootElement.TryGetProperty("NextContinuationToken", out var nextTokEl)
-                    && nextTokEl.ValueKind == JsonValueKind.String)
+                if (doc.RootElement.TryGetProperty("NextToken", out var nt) && nt.ValueKind == JsonValueKind.String)
                 {
-                    token = nextTokEl.GetString();
-                    if (string.IsNullOrWhiteSpace(token))
-                        break;
+                    token = nt.GetString();
+                    if (!string.IsNullOrWhiteSpace(token))
+                        continue;
                 }
-                else
-                {
-                    break;
-                }
+
+                break;
             }
 
-            var result = new List<S3ObjectRow>();
-
-            foreach (var item in allContents)
-            {
-                if (!item.TryGetProperty("Key", out var keyEl)) continue;
-                string key = keyEl.GetString() ?? "";
-                if (string.IsNullOrWhiteSpace(key)) continue;
-
-                // skip "folder marker" objects (keys ending with "/")
-                if (key.EndsWith("/")) continue;
-
-                long size = 0;
-                if (item.TryGetProperty("Size", out var sizeEl) && sizeEl.ValueKind == JsonValueKind.Number)
-                    size = sizeEl.GetInt64();
-
-                string lastModifiedText = "";
-                if (item.TryGetProperty("LastModified", out var lmEl) && lmEl.ValueKind == JsonValueKind.String)
-                    lastModifiedText = lmEl.GetString() ?? "";
-
-                // Display name: strip prefix path
-                string fileName = Path.GetFileName(key.Replace('/', Path.DirectorySeparatorChar));
-
-                result.Add(new S3ObjectRow
-                {
-                    Key = key,
-                    FileName = fileName,
-                    SizeBytes = size,
-                    LastModifiedText = lastModifiedText
-                });
-            }
-
-            return result;
+            return results;
         }
 
-        private async void btnRestoreFolder_Click(object sender, EventArgs e)
+        // -----------------------------
+        // AWS Process helpers
+        // -----------------------------
+        private async Task<string> RunAwsCaptureStdOutAsync(string args, CancellationToken ct)
         {
-            if (_selectedArchiveName == null)
+            var psi = new ProcessStartInfo
             {
-                MessageBox.Show(this, "Select an archive first.", "Restore Folder",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            string relPrefix = _selectedRelativePrefix; // could be ""
-            string s3Prefix = CombineS3Prefix(_selectedArchiveName, relPrefix); // "Archive/Media/"
-
-            using var dialog = new FolderBrowserDialog
-            {
-                Description = "Select local destination root (archive structure will be recreated under it)",
-                UseDescriptionForTitle = true
+                FileName = "aws",
+                Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
 
-            if (dialog.ShowDialog(this) != DialogResult.OK)
-                return;
+            using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
 
-            string destRoot = dialog.SelectedPath;
-            if (string.IsNullOrWhiteSpace(destRoot))
-                return;
+            var sbOut = new StringBuilder();
+            var sbErr = new StringBuilder();
 
-            // Local target is destRoot\ArchiveName\<relPrefix>
-            string localPath = Path.Combine(destRoot, _selectedArchiveName, relPrefix.Replace('/', Path.DirectorySeparatorChar));
-            Directory.CreateDirectory(localPath);
+            p.OutputDataReceived += (_, e) => { if (e.Data != null) sbOut.AppendLine(e.Data); };
+            p.ErrorDataReceived += (_, e) => { if (e.Data != null) sbErr.AppendLine(e.Data); };
 
-            string sourceS3 = $"s3://{BucketName}/{s3Prefix}";
-            if (!sourceS3.EndsWith("/")) sourceS3 += "/";
+            p.Start();
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
 
-            var confirm = MessageBox.Show(this,
-                $"Restore folder?\n\nS3:   {sourceS3}\nTo:   {localPath}",
-                "Confirm Folder Restore",
-                MessageBoxButtons.OKCancel,
-                MessageBoxIcon.Question);
-
-            if (confirm != DialogResult.OK)
-                return;
-
-            int exitCode = await RunAwsCommandAsync(
-                $"s3 sync \"{sourceS3}\" \"{localPath}\"",
-                _ => { /* optional: hook to a log UI later */ });
-
-            if (exitCode == 0)
+            using var reg = ct.Register(() =>
             {
-                MessageBox.Show(this, "Folder restore completed.", "Restore Folder",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            else
+                try { if (!p.HasExited) p.Kill(true); } catch { }
+            });
+
+            await p.WaitForExitAsync(ct);
+
+            if (p.ExitCode != 0)
             {
-                MessageBox.Show(this, $"Folder restore failed. Exit code: {exitCode}", "Restore Folder",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                var err = sbErr.ToString().Trim();
+                if (string.IsNullOrWhiteSpace(err)) err = "(no error output)";
+                throw new Exception($"aws {args}\n\n{err}");
             }
+
+            return sbOut.ToString();
         }
 
-        private async void btnRestoreSelectedFile_Click(object sender, EventArgs e)
+        private async Task RunAwsAsync(string args, CancellationToken ct, Action<string>? onStdErrLine = null)
         {
-            if (_selectedArchiveName == null)
+            var psi = new ProcessStartInfo
             {
-                MessageBox.Show(this, "Select an archive first.", "Restore File",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            if (gridFiles.SelectedRows.Count == 0)
-            {
-                MessageBox.Show(this, "Select a file row first.", "Restore File",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            var row = gridFiles.SelectedRows[0];
-            var keyObj = row.Cells["S3Key"].Value;
-            string key = keyObj as string ?? keyObj?.ToString() ?? "";
-
-            if (string.IsNullOrWhiteSpace(key))
-            {
-                MessageBox.Show(this, "Could not determine S3 key for selected file.", "Restore File",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-
-            using var dialog = new FolderBrowserDialog
-            {
-                Description = "Select local destination root (archive structure will be recreated under it)",
-                UseDescriptionForTitle = true
+                FileName = "aws",
+                Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
 
-            if (dialog.ShowDialog(this) != DialogResult.OK)
-                return;
+            using var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
 
-            string destRoot = dialog.SelectedPath;
-            if (string.IsNullOrWhiteSpace(destRoot))
-                return;
-
-            // Local path = destRoot\<full key path>
-            string localFullPath = Path.Combine(destRoot, key.Replace('/', Path.DirectorySeparatorChar));
-            string? dir = Path.GetDirectoryName(localFullPath);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-
-            string sourceS3 = $"s3://{BucketName}/{key}";
-
-            var confirm = MessageBox.Show(this,
-                $"Restore file?\n\nS3:   {sourceS3}\nTo:   {localFullPath}",
-                "Confirm File Restore",
-                MessageBoxButtons.OKCancel,
-                MessageBoxIcon.Question);
-
-            if (confirm != DialogResult.OK)
-                return;
-
-            int exitCode = await RunAwsCommandAsync(
-                $"s3 cp \"{sourceS3}\" \"{localFullPath}\"",
-                _ => { });
-
-            if (exitCode == 0)
+            p.ErrorDataReceived += (_, e) =>
             {
-                MessageBox.Show(this, "File restore completed.", "Restore File",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            else
+                if (e.Data != null && onStdErrLine != null)
+                    SafeUi(() => onStdErrLine(e.Data));
+            };
+
+            p.Start();
+            p.BeginErrorReadLine();
+
+            using var reg = ct.Register(() =>
             {
-                MessageBox.Show(this, $"File restore failed. Exit code: {exitCode}", "Restore File",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                try { if (!p.HasExited) p.Kill(true); } catch { }
+            });
+
+            await p.WaitForExitAsync(ct);
+
+            if (p.ExitCode != 0)
+            {
+                string err = await p.StandardError.ReadToEndAsync();
+                err = (err ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(err)) err = "(no error output)";
+                throw new Exception($"aws {args}\n\n{err}");
             }
         }
 
-        // -----------------------
-        // AWS helpers
-        // -----------------------
-
-        private Task<int> RunAwsCommandAsync(string arguments, Action<string?> onOutputLine)
+        // -----------------------------
+        // Google Chat webhook
+        // -----------------------------
+        private async Task SendChatSafeAsync(string message)
         {
-            var tcs = new TaskCompletionSource<int>();
-
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "aws",
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
+                if (string.IsNullOrWhiteSpace(_googleChatWebhookUrl))
+                    return;
 
-                var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
+                var payload = new { text = message };
+                string json = JsonSerializer.Serialize(payload);
 
-                process.OutputDataReceived += (s, e) => { if (e.Data != null) onOutputLine?.Invoke(e.Data); };
-                process.ErrorDataReceived += (s, e) => { if (e.Data != null) onOutputLine?.Invoke("[ERR] " + e.Data); };
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                var resp = await _http.PostAsync(_googleChatWebhookUrl, content);
 
-                process.Exited += (s, e) =>
+                if (!resp.IsSuccessStatusCode)
                 {
-                    tcs.TrySetResult(process.ExitCode);
-                    process.Dispose();
-                };
-
-                if (!process.Start())
-                {
-                    tcs.TrySetResult(-1);
-                }
-                else
-                {
-                    process.BeginOutputReadLine();
-                    process.BeginErrorReadLine();
+                    AppendArchiveLog($"Google Chat webhook failed: {(int)resp.StatusCode} {resp.ReasonPhrase}");
                 }
             }
             catch (Exception ex)
             {
-                onOutputLine?.Invoke("[EXCEPTION] " + ex.Message);
-                tcs.TrySetResult(-1);
+                AppendArchiveLog($"Google Chat webhook error: {ex.Message}");
             }
-
-            return tcs.Task;
         }
 
-        private async Task<string> RunAwsCommandCaptureAsync(string arguments)
+        // -----------------------------
+        // UI helpers
+        // -----------------------------
+        private void AppendArchiveLog(string line)
         {
-            var sb = new StringBuilder();
-            int exit = await RunAwsCommandAsync(arguments, line =>
+            SafeUi(() =>
             {
-                if (line != null) sb.AppendLine(line);
+                txtArchiveLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {line}{Environment.NewLine}");
             });
-
-            if (exit != 0)
-                throw new Exception($"aws exited with code {exit}. Args: {arguments}");
-
-            return sb.ToString();
         }
 
-        private async Task<JsonDocument> S3ApiListObjectsV2Async(string fullPrefix, string delimiter, string? continuationToken = null)
+        private void AppendRestoreLog(string line)
         {
-            // fullPrefix is "ArchiveName/Media/CamA/" (or "ArchiveName/")
-            // We use s3api because it returns CommonPrefixes + Contents properly.
-            var args = new StringBuilder();
-            args.Append("s3api list-objects-v2 ");
-            args.Append($"--bucket \"{BucketName}\" ");
-            args.Append($"--prefix \"{fullPrefix}\" ");
-            args.Append($"--delimiter \"{delimiter}\" ");
-            args.Append("--max-keys 1000 ");
-
-            if (!string.IsNullOrWhiteSpace(continuationToken))
+            SafeUi(() =>
             {
-                args.Append($"--continuation-token \"{continuationToken}\" ");
-            }
-
-            // --output json is default, but explicit is fine
-            args.Append("--output json");
-
-            string json = await RunAwsCommandCaptureAsync(args.ToString());
-            return JsonDocument.Parse(json);
+                txtRestoreLog.AppendText($"[{DateTime.Now:HH:mm:ss}] {line}{Environment.NewLine}");
+            });
         }
 
-        private async Task<(long totalBytes, long totalObjects)> GetArchiveStatsAsync(string archiveName)
+        private void SafeUi(Action action)
         {
-            long size = 0;
-            long count = -1;
+            if (IsDisposed) return;
+            if (InvokeRequired) BeginInvoke(action);
+            else action();
+        }
 
-            string bucketPath = $"s3://{BucketName}/{archiveName}/";
+        private void UpdateProgressWithEta(
+            ProgressBar bar,
+            Label label,
+            long bytesDone,
+            long totalBytes,
+            TimeSpan elapsed,
+            int filesDone,
+            int totalFiles
+        )
+        {
+            SafeUi(() =>
+            {
+                int pct = 0;
+                if (totalBytes > 0)
+                    pct = (int)Math.Clamp((bytesDone * 100.0) / totalBytes, 0, 100);
 
-            await RunAwsCommandAsync(
-                $"s3 ls \"{bucketPath}\" --recursive --summarize",
-                line =>
+                // If bar is in marquee, switch back to blocks to show percent
+                if (bar.Style != ProgressBarStyle.Blocks)
                 {
-                    if (line == null) return;
+                    bar.Style = ProgressBarStyle.Blocks;
+                    bar.MarqueeAnimationSpeed = 0;
+                }
 
-                    if (line.Contains("Total Size:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                        if (parts.Length > 0 && long.TryParse(parts[^1], out long parsed))
-                            size = parsed;
-                    }
-                    else if (line.Contains("Total Objects:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                        if (parts.Length > 0 && long.TryParse(parts[^1], out long parsed))
-                            count = parsed;
-                    }
-                });
+                bar.Value = Math.Clamp(pct, 0, 100);
 
-            return (size, count);
-        }
+                double seconds = Math.Max(0.001, elapsed.TotalSeconds);
+                double bps = bytesDone / seconds;
 
-        // -----------------------
-        // Google Chat webhook
-        // -----------------------
+                string etaStr = "ETA: unknown";
+                if (bps > 1 && bytesDone > 0 && totalBytes > bytesDone)
+                {
+                    double remaining = (totalBytes - bytesDone) / bps;
+                    etaStr = $"ETA: {FormatDuration(TimeSpan.FromSeconds(remaining))}";
+                }
 
-        private async Task NotifyGoogleChatAsync(string messageText)
-        {
-            if (string.IsNullOrWhiteSpace(GoogleChatWebhookUrl))
-                return;
-
-            try
-            {
-                using var client = new HttpClient();
-                var payload = new { text = messageText };
-                var json = JsonSerializer.Serialize(payload);
-                using var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                var response = await client.PostAsync(GoogleChatWebhookUrl, content);
-                // We don't throw; this shouldn't break uploads.
-            }
-            catch
-            {
-                // silent: don't block real work if chat is down
-            }
-        }
-
-        // -----------------------
-        // Misc helpers
-        // -----------------------
-
-        private static string CombineS3Prefix(string archiveName, string relativePrefix)
-        {
-            // relativePrefix is "" or "Media/CamA/"
-            if (string.IsNullOrWhiteSpace(relativePrefix))
-                return $"{archiveName}/";
-
-            // ensure trailing slash
-            string rel = relativePrefix.Replace('\\', '/');
-            if (!rel.EndsWith("/")) rel += "/";
-
-            return $"{archiveName}/{rel}";
-        }
-
-        private static string StripArchivePrefix(string archiveName, string fullPrefix)
-        {
-            // fullPrefix is "Archive/Media/CamA/"
-            string basePrefix = archiveName.TrimEnd('/') + "/";
-            if (fullPrefix.StartsWith(basePrefix, StringComparison.OrdinalIgnoreCase))
-                return fullPrefix.Substring(basePrefix.Length);
-            return fullPrefix;
-        }
-
-        private static string GetLastFolderName(string relativePrefix)
-        {
-            // "Media/CamA/" -> "CamA"
-            string p = relativePrefix.TrimEnd('/');
-            int idx = p.LastIndexOf('/');
-            return idx >= 0 ? p.Substring(idx + 1) : p;
+                label.Text =
+                    $"Progress: {pct}%  |  {filesDone:n0}/{totalFiles:n0} files  |  " +
+                    $"{FormatBytes(bytesDone)} / {FormatBytes(totalBytes)}  |  " +
+                    $"Elapsed: {FormatDuration(elapsed)}  |  {etaStr}";
+            });
         }
 
         private static string FormatBytes(long bytes)
         {
-            if (bytes < 0) return "unknown";
-
-            string[] sizes = { "B", "KiB", "MiB", "GiB", "TiB" };
-            double len = bytes;
-            int order = 0;
-
-            while (len >= 1024 && order < sizes.Length - 1)
+            string[] suf = { "B", "KB", "MB", "GB", "TB", "PB" };
+            double b = bytes;
+            int i = 0;
+            while (b >= 1024 && i < suf.Length - 1)
             {
-                order++;
-                len /= 1024;
+                b /= 1024;
+                i++;
             }
-
-            return $"{len:0.##} {sizes[order]}";
+            return $"{b:0.##} {suf[i]}";
         }
 
-        private static void AppendLog(TextBox target, string line)
+        private static string FormatDuration(TimeSpan t)
         {
-            if (target == null) return;
-
-            if (target.InvokeRequired)
-            {
-                target.BeginInvoke(new Action<TextBox, string>(AppendLog), target, line);
-                return;
-            }
-
-            if (target.TextLength == 0)
-                target.AppendText(line);
-            else
-                target.AppendText(Environment.NewLine + line);
+            if (t.TotalHours >= 1) return $"{(int)t.TotalHours}h {t.Minutes}m {t.Seconds}s";
+            if (t.TotalMinutes >= 1) return $"{t.Minutes}m {t.Seconds}s";
+            return $"{t.Seconds}s";
         }
 
-        // -----------------------
+        // -----------------------------
         // Models
-        // -----------------------
+        // -----------------------------
+        private class PrepResult
+        {
+            public int FileCount { get; set; }
+            public long TotalBytes { get; set; }
+            public List<string> Files { get; set; } = new List<string>();
+        }
 
         private class ArchiveInfo
         {
             public string Name { get; set; } = "";
             public long SizeBytes { get; set; }
             public long ObjectCount { get; set; }
+            public string SizeHuman => FormatBytes(SizeBytes);
         }
 
-        private class S3FolderRow
-        {
-            public string RelativePrefix { get; set; } = "";
-            public string DisplayName { get; set; } = "";
-        }
-
-        private class S3ObjectRow
+        private class S3FileRow
         {
             public string Key { get; set; } = "";
-            public string FileName { get; set; } = "";
             public long SizeBytes { get; set; }
-            public string LastModifiedText { get; set; } = "";
+            public string SizeHuman => FormatBytes(SizeBytes);
+            public string LastModified { get; set; } = "";
+        }
+
+        private class S3ObjectRef
+        {
+            public string Key { get; set; } = "";
+            public long SizeBytes { get; set; }
         }
     }
 }

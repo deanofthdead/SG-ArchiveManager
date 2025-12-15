@@ -1,4 +1,5 @@
-﻿using System;
+﻿// Form1.Designer.cs
+using System;
 using System.ComponentModel;
 using System.Drawing;
 using System.Windows.Forms;
@@ -32,6 +33,9 @@ namespace ArchiveManager
             this.txtSourcePath = new System.Windows.Forms.TextBox();
             this.label1 = new System.Windows.Forms.Label();
             this.tabBrowse = new System.Windows.Forms.TabPage();
+            this.progressRestore = new System.Windows.Forms.ProgressBar();
+            this.lblRestoreEta = new System.Windows.Forms.Label();
+            this.txtRestoreLog = new System.Windows.Forms.TextBox();
             this.splitBrowse = new System.Windows.Forms.SplitContainer();
             this.treeS3 = new System.Windows.Forms.TreeView();
             this.gridFiles = new System.Windows.Forms.DataGridView();
@@ -174,6 +178,9 @@ namespace ArchiveManager
             // 
             // tabBrowse
             // 
+            this.tabBrowse.Controls.Add(this.progressRestore);
+            this.tabBrowse.Controls.Add(this.lblRestoreEta);
+            this.tabBrowse.Controls.Add(this.txtRestoreLog);
             this.tabBrowse.Controls.Add(this.splitBrowse);
             this.tabBrowse.Controls.Add(this.lblBrowsePath);
             this.tabBrowse.Controls.Add(this.btnBrowseUp);
@@ -190,6 +197,36 @@ namespace ArchiveManager
             this.tabBrowse.Text = "Browse";
             this.tabBrowse.UseVisualStyleBackColor = true;
             // 
+            // progressRestore
+            // 
+            this.progressRestore.Anchor = ((System.Windows.Forms.AnchorStyles)(((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)
+            | System.Windows.Forms.AnchorStyles.Right)));
+            this.progressRestore.Location = new System.Drawing.Point(16, 602);
+            this.progressRestore.Name = "progressRestore";
+            this.progressRestore.Size = new System.Drawing.Size(1144, 20);
+            this.progressRestore.TabIndex = 10;
+            // 
+            // lblRestoreEta
+            // 
+            this.lblRestoreEta.Anchor = ((System.Windows.Forms.AnchorStyles)(((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)
+            | System.Windows.Forms.AnchorStyles.Right)));
+            this.lblRestoreEta.AutoSize = true;
+            this.lblRestoreEta.Location = new System.Drawing.Point(16, 582);
+            this.lblRestoreEta.Name = "lblRestoreEta";
+            this.lblRestoreEta.Size = new System.Drawing.Size(0, 15);
+            this.lblRestoreEta.TabIndex = 9;
+            // 
+            // txtRestoreLog
+            // 
+            this.txtRestoreLog.Anchor = ((System.Windows.Forms.AnchorStyles)(((System.Windows.Forms.AnchorStyles.Bottom | System.Windows.Forms.AnchorStyles.Left)
+            | System.Windows.Forms.AnchorStyles.Right)));
+            this.txtRestoreLog.Location = new System.Drawing.Point(16, 499);
+            this.txtRestoreLog.Multiline = true;
+            this.txtRestoreLog.Name = "txtRestoreLog";
+            this.txtRestoreLog.ScrollBars = System.Windows.Forms.ScrollBars.Both;
+            this.txtRestoreLog.Size = new System.Drawing.Size(1144, 73);
+            this.txtRestoreLog.TabIndex = 8;
+            // 
             // splitBrowse
             // 
             this.splitBrowse.Anchor = ((System.Windows.Forms.AnchorStyles)((((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Bottom)
@@ -205,7 +242,7 @@ namespace ArchiveManager
             // splitBrowse.Panel2
             // 
             this.splitBrowse.Panel2.Controls.Add(this.gridFiles);
-            this.splitBrowse.Size = new System.Drawing.Size(1144, 403);
+            this.splitBrowse.Size = new System.Drawing.Size(1144, 279);
             this.splitBrowse.SplitterDistance = 320;
             this.splitBrowse.TabIndex = 7;
             // 
@@ -214,7 +251,7 @@ namespace ArchiveManager
             this.treeS3.Dock = System.Windows.Forms.DockStyle.Fill;
             this.treeS3.Location = new System.Drawing.Point(0, 0);
             this.treeS3.Name = "treeS3";
-            this.treeS3.Size = new System.Drawing.Size(320, 403);
+            this.treeS3.Size = new System.Drawing.Size(320, 279);
             this.treeS3.TabIndex = 0;
             this.treeS3.BeforeExpand += new System.Windows.Forms.TreeViewCancelEventHandler(this.treeS3_BeforeExpand);
             this.treeS3.AfterSelect += new System.Windows.Forms.TreeViewEventHandler(this.treeS3_AfterSelect);
@@ -225,7 +262,7 @@ namespace ArchiveManager
             this.gridFiles.Location = new System.Drawing.Point(0, 0);
             this.gridFiles.Name = "gridFiles";
             this.gridFiles.RowTemplate.Height = 25;
-            this.gridFiles.Size = new System.Drawing.Size(820, 403);
+            this.gridFiles.Size = new System.Drawing.Size(820, 279);
             this.gridFiles.TabIndex = 0;
             // 
             // lblBrowsePath
@@ -313,6 +350,7 @@ namespace ArchiveManager
             this.tabArchive.ResumeLayout(false);
             this.tabArchive.PerformLayout();
             this.tabBrowse.ResumeLayout(false);
+            this.tabBrowse.PerformLayout();
             this.splitBrowse.Panel1.ResumeLayout(false);
             this.splitBrowse.Panel2.ResumeLayout(false);
             ((System.ComponentModel.ISupportInitialize)(this.splitBrowse)).EndInit();
@@ -348,5 +386,9 @@ namespace ArchiveManager
         private SplitContainer splitBrowse;
         private TreeView treeS3;
         private DataGridView gridFiles;
+
+        private TextBox txtRestoreLog;
+        private Label lblRestoreEta;
+        private ProgressBar progressRestore;
     }
 }
